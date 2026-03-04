@@ -34,6 +34,9 @@ const DEFAULTS = {
   INTERVAL_SECONDS: 0.2,
   // Screen capture defaults
   SCREEN_CAPTURE_FPS: 15,
+  WS_RECONNECT_BASE_MS: 1000,
+  WS_RECONNECT_MAX_MS: 10000,
+  WS_RECONNECT_MAX_ATTEMPTS: 5,
   ICE_SERVERS: [
     {
       urls: "turn:turn.overshoot.ai:3478?transport=udp",
@@ -272,6 +275,8 @@ export class RealtimeVision {
   private mediaStream: MediaStream | null = null;
   private peerConnection: RTCPeerConnection | null = null;
   private webSocket: WebSocket | null = null;
+  private wsReconnectTimer: number | null = null;
+  private wsReconnectAttempt: number = 0;
   private streamId: string | null = null;
   private keepaliveInterval: number | null = null;
   private videoElement: HTMLVideoElement | null = null;
@@ -1027,6 +1032,7 @@ export class RealtimeVision {
       try {
         const result: StreamInferenceResult = JSON.parse(event.data);
         this.config.onResult(result);
+        this.wsReconnectAttempt = 0;
       } catch (error) {
         const parseError = new Error(
           `Failed to parse WebSocket message: ${error instanceof Error ? error.message : String(error)}`,
@@ -1036,14 +1042,14 @@ export class RealtimeVision {
     };
 
     this.webSocket.onerror = () => {
+      // onerror is always followed by onclose; let onclose handle the decision.
       this.logger.error("WebSocket error occurred");
-      const error = new Error("WebSocket error occurred");
-      this.handleFatalError(error);
     };
 
     this.webSocket.onclose = (event) => {
       if (this.isRunning) {
         if (event.code === 1008) {
+          // Auth failure — non-recoverable
           this.logger.error("WebSocket authentication failed:", event.reason);
           const error = new Error(
             `WebSocket authentication failed: ${event.reason || "Invalid or revoked API key"}`,
@@ -1056,21 +1062,71 @@ export class RealtimeVision {
           const error = new Error(event.reason);
           this.handleFatalError(error);
         } else {
+          // Unexpected close while running — attempt reconnect
           this.logger.warn(
             "WebSocket closed unexpectedly:",
             event.code,
             event.reason,
           );
-          const error = new Error(
-            event.reason ||
-              `WebSocket closed unexpectedly (code: ${event.code})`,
-          );
-          this.handleFatalError(error);
+          this.scheduleWsReconnect();
         }
       } else {
         this.logger.debug("WebSocket closed");
       }
     };
+  }
+
+  /**
+   * Schedule a WebSocket reconnection with exponential backoff
+   */
+  private scheduleWsReconnect(): void {
+    if (!this.isRunning || !this.streamId) {
+      return;
+    }
+
+    if (this.wsReconnectAttempt >= DEFAULTS.WS_RECONNECT_MAX_ATTEMPTS) {
+      const error = new Error(
+        `WebSocket reconnection failed after ${DEFAULTS.WS_RECONNECT_MAX_ATTEMPTS} attempts`,
+      );
+      this.handleFatalError(error);
+      return;
+    }
+
+    const delay = Math.min(
+      DEFAULTS.WS_RECONNECT_BASE_MS * Math.pow(2, this.wsReconnectAttempt),
+      DEFAULTS.WS_RECONNECT_MAX_MS,
+    );
+
+    this.logger.info(
+      `WebSocket reconnecting (attempt ${this.wsReconnectAttempt + 1}/${DEFAULTS.WS_RECONNECT_MAX_ATTEMPTS}) in ${delay}ms...`,
+    );
+
+    this.wsReconnectTimer = window.setTimeout(
+      () => this.attemptWsReconnect(),
+      delay,
+    );
+    this.wsReconnectAttempt++;
+  }
+
+  /**
+   * Attempt to reconnect the WebSocket
+   */
+  private attemptWsReconnect(): void {
+    if (!this.isRunning || !this.streamId) {
+      return;
+    }
+
+    // Close old WS reference if it still exists
+    if (this.webSocket) {
+      try {
+        this.webSocket.close();
+      } catch {
+        // ignore
+      }
+      this.webSocket = null;
+    }
+
+    this.setupWebSocket(this.streamId);
   }
 
   /**
@@ -1157,6 +1213,12 @@ export class RealtimeVision {
       window.clearInterval(this.keepaliveInterval);
       this.keepaliveInterval = null;
     }
+
+    if (this.wsReconnectTimer) {
+      window.clearTimeout(this.wsReconnectTimer);
+      this.wsReconnectTimer = null;
+    }
+    this.wsReconnectAttempt = 0;
 
     if (this.webSocket) {
       this.webSocket.close();
