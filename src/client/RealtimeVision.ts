@@ -1,6 +1,10 @@
 import { StreamClient } from "./client";
 import { DEFAULT_API_URL } from "./constants";
 import { createHlsStream } from "./hlsStream";
+import {
+  connectAndPublish,
+  type LiveKitTransportHandle,
+} from "./livekitTransport";
 
 import {
   type StreamInferenceResult,
@@ -11,6 +15,7 @@ import {
   type FrameProcessingConfig,
   type ModelBackend,
   type SourceConfig,
+  type StreamCreateRequest,
 } from "./types";
 
 /**
@@ -29,6 +34,9 @@ const DEFAULTS = {
   INTERVAL_SECONDS: 0.2,
   // Screen capture defaults
   SCREEN_CAPTURE_FPS: 15,
+  WS_RECONNECT_BASE_MS: 1000,
+  WS_RECONNECT_MAX_MS: 10000,
+  WS_RECONNECT_MAX_ATTEMPTS: 5,
   ICE_SERVERS: [
     {
       urls: "turn:turn.overshoot.ai:3478?transport=udp",
@@ -267,6 +275,8 @@ export class RealtimeVision {
   private mediaStream: MediaStream | null = null;
   private peerConnection: RTCPeerConnection | null = null;
   private webSocket: WebSocket | null = null;
+  private wsReconnectTimer: number | null = null;
+  private wsReconnectAttempt: number = 0;
   private streamId: string | null = null;
   private keepaliveInterval: number | null = null;
   private videoElement: HTMLVideoElement | null = null;
@@ -276,6 +286,7 @@ export class RealtimeVision {
   private rawScreenStream: MediaStream | null = null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private hlsInstance: any = null;
+  private livekitTransport: LiveKitTransportHandle | null = null;
 
   private isRunning = false;
 
@@ -862,17 +873,17 @@ export class RealtimeVision {
       this.logger.debug("Starting stream with source type:", source.type);
 
       const mode = this.getMode();
-      let sourceConfig: SourceConfig;
+      let sourceConfig: SourceConfig | undefined;
 
       if (source.type === "livekit") {
-        // LiveKit path: no local media or WebRTC setup needed
+        // User-managed LiveKit: pass through url + token, no local media
         sourceConfig = {
           type: "livekit",
           url: source.url,
           token: source.token,
         };
       } else {
-        // WebRTC path: camera or video file
+        // Native LiveKit path: capture media locally, omit source from request
         if (source.type === "video") {
           this.logger.debug("Video file:", {
             name: source.file.name,
@@ -892,44 +903,7 @@ export class RealtimeVision {
           throw new Error("No video track available");
         }
 
-        // Set up WebRTC peer connection
-        const iceServers = this.config.iceServers ?? DEFAULTS.ICE_SERVERS;
-        this.logger.debug("Creating peer connection with ICE servers");
-        this.peerConnection = new RTCPeerConnection({ iceServers });
-
-        // Set up ICE logging
-        this.peerConnection.onicecandidate = (event) => {
-          if (event.candidate) {
-            this.logger.debug("ICE candidate:", {
-              type: event.candidate.type,
-              protocol: event.candidate.protocol,
-            });
-          } else {
-            this.logger.debug("ICE gathering complete");
-          }
-        };
-
-        this.peerConnection.oniceconnectionstatechange = () => {
-          this.logger.debug(
-            "ICE connection state:",
-            this.peerConnection?.iceConnectionState,
-          );
-        };
-
-        this.peerConnection.addTrack(videoTrack, this.mediaStream);
-
-        // Create and set local offer
-        const offer = await this.peerConnection.createOffer();
-        await this.peerConnection.setLocalDescription(offer);
-
-        if (!this.peerConnection.localDescription) {
-          throw new Error("Failed to create local description");
-        }
-
-        sourceConfig = {
-          type: "webrtc",
-          sdp: this.peerConnection.localDescription.sdp,
-        };
+        // sourceConfig stays undefined — backend defaults to native LiveKit
       }
 
       // Get FPS — only needed for legacy fps/sampling_ratio format
@@ -945,8 +919,7 @@ export class RealtimeVision {
 
       // Create stream on server
       this.logger.debug("Creating stream on server with mode:", mode);
-      const response = await this.client.createStream({
-        source: sourceConfig,
+      const request: StreamCreateRequest = {
         mode,
         processing: this.getProcessingConfig(detectedFps),
         inference: {
@@ -958,7 +931,11 @@ export class RealtimeVision {
             max_output_tokens: this.config.maxOutputTokens,
           }),
         },
-      });
+      };
+      if (sourceConfig !== undefined) {
+        request.source = sourceConfig;
+      }
+      const response = await this.client.createStream(request);
 
       this.logger.debug("Backend response received:", {
         stream_id: response.stream_id,
@@ -968,6 +945,27 @@ export class RealtimeVision {
       // Set remote description (only for WebRTC sources)
       if (response.webrtc && this.peerConnection) {
         await this.peerConnection.setRemoteDescription(response.webrtc);
+      }
+
+      // Connect to LiveKit room and publish track (native LiveKit path)
+      if (response.livekit && this.mediaStream) {
+        const videoTrack = this.mediaStream.getVideoTracks()[0];
+        this.livekitTransport = await connectAndPublish({
+          url: response.livekit.url,
+          token: response.livekit.token,
+          videoTrack,
+          onReconnecting: () => this.logger.warn("LiveKit reconnecting..."),
+          onReconnected: () => this.logger.info("LiveKit reconnected"),
+          onDisconnected: (reason) => {
+            if (this.isRunning) {
+              this.handleFatalError(
+                new Error(
+                  `LiveKit disconnected: ${reason ?? "unknown"}`,
+                ),
+              );
+            }
+          },
+        });
       }
 
       this.streamId = response.stream_id;
@@ -1000,8 +998,11 @@ export class RealtimeVision {
     this.keepaliveInterval = window.setInterval(async () => {
       try {
         if (this.streamId) {
-          await this.client.renewLease(this.streamId);
+          const response = await this.client.renewLease(this.streamId);
           this.logger.debug("Lease renewed");
+          if (response.livekit_token) {
+            this.livekitTransport?.updateToken(response.livekit_token);
+          }
         }
       } catch (error) {
         this.logger.error("Keepalive failed:", error);
@@ -1031,6 +1032,7 @@ export class RealtimeVision {
       try {
         const result: StreamInferenceResult = JSON.parse(event.data);
         this.config.onResult(result);
+        this.wsReconnectAttempt = 0;
       } catch (error) {
         const parseError = new Error(
           `Failed to parse WebSocket message: ${error instanceof Error ? error.message : String(error)}`,
@@ -1040,14 +1042,14 @@ export class RealtimeVision {
     };
 
     this.webSocket.onerror = () => {
+      // onerror is always followed by onclose; let onclose handle the decision.
       this.logger.error("WebSocket error occurred");
-      const error = new Error("WebSocket error occurred");
-      this.handleFatalError(error);
     };
 
     this.webSocket.onclose = (event) => {
       if (this.isRunning) {
         if (event.code === 1008) {
+          // Auth failure — non-recoverable
           this.logger.error("WebSocket authentication failed:", event.reason);
           const error = new Error(
             `WebSocket authentication failed: ${event.reason || "Invalid or revoked API key"}`,
@@ -1060,21 +1062,71 @@ export class RealtimeVision {
           const error = new Error(event.reason);
           this.handleFatalError(error);
         } else {
+          // Unexpected close while running — attempt reconnect
           this.logger.warn(
             "WebSocket closed unexpectedly:",
             event.code,
             event.reason,
           );
-          const error = new Error(
-            event.reason ||
-              `WebSocket closed unexpectedly (code: ${event.code})`,
-          );
-          this.handleFatalError(error);
+          this.scheduleWsReconnect();
         }
       } else {
         this.logger.debug("WebSocket closed");
       }
     };
+  }
+
+  /**
+   * Schedule a WebSocket reconnection with exponential backoff
+   */
+  private scheduleWsReconnect(): void {
+    if (!this.isRunning || !this.streamId) {
+      return;
+    }
+
+    if (this.wsReconnectAttempt >= DEFAULTS.WS_RECONNECT_MAX_ATTEMPTS) {
+      const error = new Error(
+        `WebSocket reconnection failed after ${DEFAULTS.WS_RECONNECT_MAX_ATTEMPTS} attempts`,
+      );
+      this.handleFatalError(error);
+      return;
+    }
+
+    const delay = Math.min(
+      DEFAULTS.WS_RECONNECT_BASE_MS * Math.pow(2, this.wsReconnectAttempt),
+      DEFAULTS.WS_RECONNECT_MAX_MS,
+    );
+
+    this.logger.info(
+      `WebSocket reconnecting (attempt ${this.wsReconnectAttempt + 1}/${DEFAULTS.WS_RECONNECT_MAX_ATTEMPTS}) in ${delay}ms...`,
+    );
+
+    this.wsReconnectTimer = window.setTimeout(
+      () => this.attemptWsReconnect(),
+      delay,
+    );
+    this.wsReconnectAttempt++;
+  }
+
+  /**
+   * Attempt to reconnect the WebSocket
+   */
+  private attemptWsReconnect(): void {
+    if (!this.isRunning || !this.streamId) {
+      return;
+    }
+
+    // Close old WS reference if it still exists
+    if (this.webSocket) {
+      try {
+        this.webSocket.close();
+      } catch {
+        // ignore
+      }
+      this.webSocket = null;
+    }
+
+    this.setupWebSocket(this.streamId);
   }
 
   /**
@@ -1151,9 +1203,51 @@ export class RealtimeVision {
   }
 
   private async cleanup(): Promise<void> {
+    // Set isRunning to false early so that event callbacks fired during
+    // teardown (WebSocket onclose, LiveKit onDisconnected) don't trigger
+    // additional handleFatalError → cleanup cascades.
+    this.isRunning = false;
     this.logger.debug("Cleaning up resources");
 
-    // Close stream on server (triggers final billing)
+    if (this.keepaliveInterval) {
+      window.clearInterval(this.keepaliveInterval);
+      this.keepaliveInterval = null;
+    }
+
+    if (this.wsReconnectTimer) {
+      window.clearTimeout(this.wsReconnectTimer);
+      this.wsReconnectTimer = null;
+    }
+    this.wsReconnectAttempt = 0;
+
+    if (this.webSocket) {
+      this.webSocket.close();
+      this.webSocket = null;
+    }
+
+    // Disconnect LiveKit before closing the server-side stream.
+    // closeStream() tells the server to tear down the LiveKit room, which
+    // sends a "leave" signal that races with our local disconnect and causes
+    // "could not createOffer with closed peer connection" errors.
+    if (this.livekitTransport) {
+      try {
+        await this.livekitTransport.disconnect();
+      } catch (error) {
+        this.logger.warn(
+          "Failed to disconnect LiveKit:",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      this.livekitTransport = null;
+    }
+
+    if (this.peerConnection) {
+      this.peerConnection.close();
+      this.peerConnection = null;
+    }
+
+    // Close stream on server (triggers final billing).
+    // Done after local transports are torn down to avoid race conditions.
     if (this.streamId) {
       try {
         await this.client.closeStream(this.streamId);
@@ -1165,21 +1259,6 @@ export class RealtimeVision {
           error instanceof Error ? error.message : String(error),
         );
       }
-    }
-
-    if (this.keepaliveInterval) {
-      window.clearInterval(this.keepaliveInterval);
-      this.keepaliveInterval = null;
-    }
-
-    if (this.webSocket) {
-      this.webSocket.close();
-      this.webSocket = null;
-    }
-
-    if (this.peerConnection) {
-      this.peerConnection.close();
-      this.peerConnection = null;
     }
 
     if (this.mediaStream) {

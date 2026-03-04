@@ -114,16 +114,22 @@ export type LiveKitSourceConfig = { type: "livekit"; url: string; token: string 
 export type SourceConfig = WebRTCSourceConfig | LiveKitSourceConfig;
 
 export type StreamCreateRequest = {
-  source: SourceConfig;
+  source?: SourceConfig;
   mode?: StreamMode;
   processing: StreamProcessingConfig;
   inference: StreamInferenceConfig;
   client?: StreamClientMeta;
 };
 
+export type LiveKitRoomInfo = {
+  url: string;
+  token: string;
+};
+
 export type StreamCreateResponse = {
   stream_id: string;
   webrtc?: WebRtcAnswer;
+  livekit?: LiveKitRoomInfo;
   lease?: {
     ttl_seconds: number;
   };
@@ -168,6 +174,7 @@ export type KeepaliveResponse = {
   status: "ok";
   stream_id: string;
   ttl_seconds: number;
+  livekit_token?: string;
 };
 
 export type StatusResponse = {
