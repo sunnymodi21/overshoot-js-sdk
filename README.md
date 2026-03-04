@@ -70,9 +70,9 @@ await vision.start();
 
 > **Note:** Screen capture requires desktop browsers with getDisplayMedia API support. The user will be prompted to select which screen/window to share.
 
-### LiveKit Source
+### LiveKit Source (User-Managed)
 
-If you're on a restrictive network where direct WebRTC connections fail, you can use LiveKit as an alternative video transport. With this source type, you publish video to a LiveKit room yourself, and the SDK handles the server-side stream creation and inference results.
+If you already run your own LiveKit infrastructure and want to publish video yourself, you can pass your room credentials directly. The SDK skips local media capture and tells the server to read from your room instead.
 
 ```typescript
 const vision = new RealtimeVision({
@@ -92,7 +92,7 @@ const vision = new RealtimeVision({
 await vision.start();
 ```
 
-> **Note:** With a LiveKit source, the SDK does not create a local media stream or WebRTC peer connection. You are responsible for publishing video to the LiveKit room using the [LiveKit client SDK](https://docs.livekit.io/). The `getMediaStream()` method will return `null` for LiveKit sources.
+> **Note:** With a user-managed LiveKit source, the SDK does not create a local media stream. You are responsible for publishing video to the LiveKit room using the [LiveKit client SDK](https://docs.livekit.io/). The `getMediaStream()` method will return `null` for LiveKit sources.
 
 ## Configuration
 
@@ -131,7 +131,7 @@ interface RealtimeVisionConfig {
     interval_seconds?: number; // Interval between frame captures (0.1-60s, default: 0.2)
   };
 
-  iceServers?: RTCIceServer[]; // Custom WebRTC ICE servers (uses Overshoot TURN servers by default)
+  iceServers?: RTCIceServer[]; // Unused by default (legacy WebRTC path)
 }
 ```
 
@@ -369,6 +369,19 @@ vision.isActive(); // Check if stream is running
 
 ## Stream Lifecycle
 
+### Video Transport
+
+The SDK uses [LiveKit](https://livekit.io/) as its video transport. When you call `start()` with a camera, video file, screen, or HLS source, the following happens:
+
+1. The SDK captures media locally and creates the stream on the server (no `source` field is sent in the request).
+2. The server creates a LiveKit room and returns connection credentials (`url` + `token`).
+3. The SDK connects to the room and publishes the video track.
+4. Keepalive responses include a refreshed `livekit_token` to maintain the connection.
+
+This is fully automatic — you don't need to install or configure LiveKit yourself. The `livekit-client` dependency is dynamically imported only when a stream starts, so it doesn't affect initial bundle size.
+
+For user-managed LiveKit sources (`{ type: "livekit", url, token }`), the flow is different: the SDK sends your room credentials to the server, and the server reads video from your room directly. No local media capture or LiveKit connection happens on the client side.
+
 ### Keepalive
 
 Streams have a server-side lease (30 second TTL). The SDK automatically sends keepalive requests to renew it. You don't need to manage keepalives manually.
@@ -535,30 +548,23 @@ function VisionComponent() {
 
 ## Advanced: Custom Video Sources with StreamClient
 
-For advanced use cases like streaming from a canvas, screen capture, or other custom sources, use `StreamClient` directly:
+For advanced use cases like streaming from a canvas or other custom sources, use `StreamClient` directly. The server creates a LiveKit room — you connect and publish your track.
 
 ```typescript
 import { StreamClient } from "overshoot";
+import { Room, Track } from "livekit-client";
 
 const client = new StreamClient({
   apiKey: "your-api-key",
 });
 
-// Get stream from any source (canvas, screen capture, etc.)
+// Get stream from any source (canvas, custom pipeline, etc.)
 const canvas = document.querySelector("canvas");
 const stream = canvas.captureStream(30);
 const videoTrack = stream.getVideoTracks()[0];
 
-// Set up WebRTC connection
-const peerConnection = new RTCPeerConnection({ iceServers: [...] }); // See default ice servers in RealtimeVison.ts file
-peerConnection.addTrack(videoTrack, stream);
-
-const offer = await peerConnection.createOffer();
-await peerConnection.setLocalDescription(offer);
-
-// Create stream on server
+// Create stream on server (omit source → server creates a LiveKit room)
 const response = await client.createStream({
-  source: { type: "webrtc", sdp: peerConnection.localDescription.sdp },
   mode: "clip",
   processing: {
     target_fps: 10,
@@ -573,9 +579,13 @@ const response = await client.createStream({
   },
 });
 
-if (response.webrtc) {
-  await peerConnection.setRemoteDescription(response.webrtc);
-}
+// Connect to LiveKit room and publish track
+const room = new Room({ adaptiveStream: false, dynacast: false });
+await room.connect(response.livekit.url, response.livekit.token);
+await room.localParticipant.publishTrack(videoTrack, {
+  source: Track.Source.Camera,
+  simulcast: false,
+});
 
 // Connect WebSocket for results
 const ws = client.connectWebSocket(response.stream_id);
@@ -584,6 +594,13 @@ ws.onmessage = (event) => {
   const result = JSON.parse(event.data);
   console.log("Result:", result);
 };
+
+// Don't forget keepalives (lease TTL is 30s)
+// Each keepalive response includes a refreshed livekit_token
+const keepalive = setInterval(async () => {
+  const res = await client.renewLease(response.stream_id);
+  // Optionally update room token: room.updateToken(res.livekit_token)
+}, 15000);
 ```
 
 ## Examples
@@ -758,7 +775,6 @@ The SDK provides specific error classes for different failure modes:
 
 Requires browsers with support for:
 
-- WebRTC (RTCPeerConnection)
 - MediaStream API
 - WebSocket
 - Modern JavaScript (ES2020+)
