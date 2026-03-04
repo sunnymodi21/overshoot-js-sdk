@@ -375,7 +375,9 @@ Streams have a server-side lease (30 second TTL). The SDK automatically sends ke
 
 If a keepalive fails (e.g., network issues), the stream will stop and `onError` will be called. If your account runs out of credits, the keepalive returns a 402 error and the stream expires — this is terminal and requires starting a new stream after adding credits.
 
-**Network disconnects are permanent.** If the client loses connectivity for more than 30 seconds, the lease expires and the stream is destroyed. There is no automatic reconnection — you must call `start()` to create a new stream.
+**WebSocket auto-reconnect.** If the result WebSocket disconnects unexpectedly (e.g., a transient server restart), the SDK automatically reconnects with exponential backoff (up to 5 attempts). Video publishing continues uninterrupted during reconnection — only result delivery pauses briefly. If all reconnection attempts fail, `onError` is called and the stream stops.
+
+**Lease expiry is permanent.** If the client loses connectivity for longer than the lease TTL (30 seconds) and keepalives cannot reach the server, the lease expires and the stream is destroyed. You must call `start()` to create a new stream.
 
 ### State and Memory
 
