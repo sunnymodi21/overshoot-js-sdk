@@ -31,7 +31,7 @@ const DEFAULTS = {
   SAMPLING_RATIO: 0.8,
   FALLBACK_FPS: 30,
   // Frame mode defaults
-  INTERVAL_SECONDS: 0.2,
+  INTERVAL_SECONDS: 0.5,
   // Screen capture defaults
   SCREEN_CAPTURE_FPS: 15,
   WS_RECONNECT_BASE_MS: 1000,
@@ -213,8 +213,8 @@ export interface RealtimeVisionConfig {
    * - "frame": Single image inference at intervals (for static analysis)
    *
    * If not specified, mode is inferred from processing config:
-   * - If interval_seconds is present → frame mode
-   * - Otherwise → clip mode (default)
+   * - If clipProcessing or processing is present → clip mode
+   * - Otherwise → frame mode (default)
    */
   mode?: StreamMode;
 
@@ -228,7 +228,7 @@ export interface RealtimeVisionConfig {
   /**
    * Frame mode processing configuration
    * Used when mode is "frame"
-   * @default { interval_seconds: 0.2 }
+   * @default { interval_seconds: 0.5 }
    */
   frameProcessing?: FrameModeProcessing;
 
@@ -804,11 +804,16 @@ export class RealtimeVision {
     }
 
     // Infer mode from processing config
-    if (this.config.frameProcessing?.interval_seconds !== undefined) {
-      return "frame";
+    if (this.config.clipProcessing?.target_fps !== undefined ||
+        this.config.clipProcessing?.clip_length_seconds !== undefined ||
+        this.config.clipProcessing?.delay_seconds !== undefined ||
+        this.config.clipProcessing?.fps !== undefined ||
+        this.config.clipProcessing?.sampling_ratio !== undefined ||
+        this.config.processing !== undefined) {
+      return "clip";
     }
 
-    return "clip";
+    return "frame";
   }
 
   /**
